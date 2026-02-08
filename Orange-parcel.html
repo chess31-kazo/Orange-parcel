@@ -1,0 +1,584 @@
+﻿import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  onSnapshot, 
+  updateDoc, 
+  deleteDoc, 
+  addDoc 
+} from 'firebase/firestore';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  ChevronLeft, 
+  Camera, 
+  CheckCircle, 
+  User, 
+  Plus, 
+  X, 
+  Trash2, 
+  PenTool, 
+  Lock, 
+  UserCheck, 
+  MapPin,
+  ShieldAlert,
+  Loader2
+} from 'lucide-react';
+
+// --- 安全初始化 Firebase 配置 ---
+let firebaseConfig = {};
+try {
+  firebaseConfig = JSON.parse(__firebase_config);
+} catch (e) {
+  console.warn("Firebase config not found.");
+}
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'muji-parcel-v1';
+
+// --- 常數配置 ---
+const STATUS_CONFIG = {
+  pending: { label: '運送中', color: 'bg-blue-50 text-blue-600 border-blue-100' },
+  arrived: { label: '已送達 (待簽收)', color: 'bg-amber-50 text-amber-700 border-amber-100' },
+  signed: { label: '已完成', color: 'bg-green-50 text-green-700 border-green-100' }
+};
+
+// --- 工具：圖片壓縮 ---
+const compressImage = (base64Str, maxWidth = 800, quality = 0.7) => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.src = base64Str;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+      if (width > maxWidth) {
+        height = (maxWidth / width) * height;
+        width = maxWidth;
+      }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      // 確保即使是照片壓縮也有白底背景（防止 PNG 透明處變黑）
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+  });
+};
+
+// --- 組件：全螢幕存證預覽 ---
+const ProofPreview = ({ type, data, onCancel }) => (
+  <div className="fixed inset-0 bg-black/95 z-[100] flex flex-col animate-in fade-in duration-200 backdrop-blur-sm">
+    <div className="p-4 flex justify-between items-center text-white border-b border-white/10 mt-safe">
+      <span className="font-bold text-orange-400 tracking-wider">{type === 'photo' ? '實體照片' : '手寫簽名'}</span>
+      <button onClick={onCancel} className="p-3 bg-white/10 rounded-full active:scale-90 transition-transform"><X size={24} /></button>
+    </div>
+    <div className="flex-1 flex items-center justify-center p-6">
+      <img src={data} className="max-w-full max-h-full rounded-2xl shadow-2xl border border-white/20 object-contain" alt="Proof" />
+    </div>
+  </div>
+);
+
+// --- 組件：手寫簽名板 (修正黑底問題) ---
+const SignaturePad = ({ onSave, onCancel }) => {
+  const canvasRef = useRef(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    
+    // 初始化背景為白色，避免透明導出變黑
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, rect.width, rect.height);
+
+    ctx.strokeStyle = "#1c1917";
+    ctx.lineWidth = 4;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    
+    const preventDefault = (e) => { if (e.touches.length === 1) e.preventDefault(); };
+    canvas.addEventListener('touchstart', preventDefault, { passive: false });
+    return () => canvas.removeEventListener('touchstart', preventDefault);
+  }, []);
+
+  const getPointerPos = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  };
+
+  const startDrawing = (e) => {
+    const { x, y } = getPointerPos(e);
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    setIsDrawing(true);
+  };
+
+  const draw = (e) => {
+    if (!isDrawing) return;
+    const { x, y } = getPointerPos(e);
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const handleFinish = async () => {
+    const canvas = canvasRef.current;
+    // 導出前再次確認背景是白的 (有些瀏覽器清空畫布後會重置)
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    onSave(dataUrl);
+  };
+
+  return (
+    <div className="fixed inset-0 flex flex-col h-full bg-[#fcfcf9] z-[90] animate-in slide-in-from-bottom duration-300">
+      <div className="p-4 border-b flex justify-between items-center bg-white mt-safe">
+        <button onClick={onCancel} className="p-2 text-stone-400 active:scale-90"><X /></button>
+        <span className="font-black text-stone-800 tracking-tight">手寫簽收確認</span>
+        <button onClick={() => {
+          const canvas = canvasRef.current;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }} className="text-xs font-bold text-orange-500 bg-orange-50 px-4 py-2 rounded-full">重填</button>
+      </div>
+      <div className="flex-1 p-6 flex flex-col">
+        <div className="flex-1 bg-white rounded-[32px] shadow-sm border border-stone-100 overflow-hidden relative">
+          <canvas 
+            ref={canvasRef} 
+            className="w-full h-full touch-none"
+            onMouseDown={startDrawing} onMouseMove={draw} onMouseUp={() => setIsDrawing(false)}
+            onTouchStart={startDrawing} onTouchMove={draw} onTouchEnd={() => setIsDrawing(false)}
+          />
+          <div className="absolute bottom-6 left-0 right-0 text-center pointer-events-none">
+            <p className="text-[10px] text-stone-300 font-bold uppercase tracking-[0.2em]">請在框內簽名</p>
+          </div>
+        </div>
+        <div className="py-8">
+          <button 
+            onClick={handleFinish} 
+            className="w-full bg-stone-900 text-white h-16 rounded-2xl font-black text-lg shadow-xl active:scale-95 transition-all"
+          >
+            確認簽名完成
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- 通用按鈕 ---
+const Button = ({ children, onClick, variant = 'primary', className = '', disabled = false, icon: Icon, loading = false }) => {
+  const variants = {
+    primary: "bg-[#1c1917] text-white",
+    orange: "bg-orange-500 text-white shadow-lg shadow-orange-100",
+    success: "bg-green-600 text-white shadow-lg shadow-green-100",
+    danger: "bg-red-50 text-red-600",
+    secondary: "bg-stone-100 text-stone-600"
+  };
+  return (
+    <button 
+      onClick={onClick} 
+      disabled={disabled || loading} 
+      className={`flex items-center justify-center px-6 py-4 rounded-2xl text-sm font-black transition-all active:scale-95 disabled:opacity-30 touch-manipulation ${variants[variant]} ${className}`}
+    >
+      {loading ? <Loader2 className="animate-spin" size={18} /> : (
+        <>
+          {Icon && <Icon size={18} className="mr-2" />}
+          {children}
+        </>
+      )}
+    </button>
+  );
+};
+
+// --- 頁面：包裹詳情 ---
+const PackageDetail = ({ pkg, onBack, onStatusUpdate, onDelete, onStartAction, onAddPhotoOnly, tempProofs, userRole, processing }) => {
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [activePreview, setActivePreview] = useState(null); 
+  const isAdmin = userRole === 'admin';
+
+  return (
+    <div className="flex flex-col h-full bg-[#fcfcf9] relative animate-in fade-in slide-in-from-right-4 duration-300 overflow-hidden">
+      {activePreview && <ProofPreview type={activePreview.type} data={activePreview.data} onCancel={() => setActivePreview(null)} />}
+
+      <div className="bg-white/90 backdrop-blur-lg p-4 border-b flex justify-between items-center sticky top-0 z-40 mt-safe">
+        <div className="flex items-center">
+          <button onClick={onBack} className="p-2 -ml-2 active:scale-75 transition-transform"><ChevronLeft size={28} /></button>
+          <span className="ml-1 font-black text-lg tracking-tight">包裹詳情</span>
+        </div>
+        {isAdmin && <button onClick={() => setShowDeleteConfirm(true)} className="p-2 text-stone-300 active:text-red-500 transition-colors"><Trash2 size={22} /></button>}
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-6 pt-6 pb-40 space-y-6">
+        <div className="bg-white p-8 rounded-[40px] border border-stone-100 shadow-sm text-center">
+          <div className="w-16 h-16 bg-orange-50 rounded-2xl flex items-center justify-center mx-auto mb-4 text-orange-500 shadow-inner"><User size={32} /></div>
+          <h2 className="text-3xl font-black text-stone-900 tracking-tighter mb-1">{pkg.recipient}</h2>
+          <p className="text-stone-400 text-[11px] font-mono font-bold tracking-widest uppercase mb-4">{pkg.tracking}</p>
+          <div className={`inline-flex items-center px-4 py-1.5 rounded-full border text-[10px] font-black uppercase tracking-wider ${STATUS_CONFIG[pkg.status].color}`}>
+            {STATUS_CONFIG[pkg.status].label}
+          </div>
+        </div>
+
+        {isAdmin && (
+          <div className="flex justify-center">
+            <button onClick={onAddPhotoOnly} className="flex items-center gap-2 px-6 py-3 bg-white border border-stone-200 rounded-full text-stone-700 text-xs font-black shadow-sm active:bg-stone-50 transition-all">
+              <Camera size={16} className="text-orange-500" /> 追加現場照片
+            </button>
+          </div>
+        )}
+
+        <div className="bg-white p-7 rounded-[40px] border border-stone-100 shadow-sm">
+          <h3 className="font-black text-[11px] mb-8 text-stone-400 uppercase tracking-[0.2em] flex items-center">
+            <div className="w-4 h-[1px] bg-stone-200 mr-2"></div> 物流進度日誌
+          </h3>
+          <div className="space-y-10 relative ml-1">
+            <div className="absolute left-[3px] top-2 bottom-2 w-[1px] bg-stone-100"></div>
+            {pkg.timeline?.slice().reverse().map((t, i) => (
+              <div key={i} className="relative pl-8">
+                <div className={`absolute left-0 top-1.5 w-2 h-2 rounded-full border-2 border-white ring-2 ${i === 0 ? 'ring-orange-500 bg-orange-500' : 'ring-stone-200 bg-stone-200'}`}></div>
+                <div className="flex justify-between items-start gap-4">
+                  <div>
+                    <p className={`text-sm font-black tracking-tight ${i === 0 ? 'text-stone-900' : 'text-stone-400'}`}>{t.status}</p>
+                    <p className="text-[10px] text-stone-400 font-mono mt-0.5">{t.time}</p>
+                  </div>
+                  <div className="flex flex-col gap-2 shrink-0">
+                    {t.proofs?.photo && (
+                      <button onClick={() => setActivePreview({ type: 'photo', data: t.proofs.photo })} className="text-[10px] font-black text-orange-600 bg-orange-50 px-4 py-2 rounded-xl active:bg-orange-100 border border-orange-100/50">查看照片</button>
+                    )}
+                    {t.proofs?.signature && (
+                      <button onClick={() => setActivePreview({ type: 'signature', data: t.proofs.signature })} className="text-[10px] font-black text-blue-600 bg-blue-50 px-4 py-2 rounded-xl active:bg-blue-100 border border-blue-100/50">查看簽名</button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {isAdmin && pkg.status === 'arrived' && (
+          <div className="bg-[#1c1917] p-8 rounded-[40px] shadow-2xl text-white">
+            <h3 className="font-black text-sm tracking-tight flex items-center mb-6"><CheckCircle size={18} className="mr-2 text-orange-500" /> 簽收作業</h3>
+            <div className="grid grid-cols-2 gap-4">
+              <button onClick={() => onStartAction('camera')} className={`flex flex-col items-center p-6 rounded-3xl border-2 transition-all ${tempProofs.photo ? 'bg-orange-500 border-orange-400 text-white' : 'bg-white/5 border-white/10 text-stone-500'}`}>
+                <Camera size={32} className="mb-3" />
+                <span className="text-xs font-black">{tempProofs.photo ? '更新照片' : '拍攝包裹'}</span>
+              </button>
+              <button onClick={() => onStartAction('signature')} className={`flex flex-col items-center p-6 rounded-3xl border-2 transition-all ${tempProofs.signature ? 'bg-orange-500 border-orange-400 text-white' : 'bg-white/5 border-white/10 text-stone-500'}`}>
+                <PenTool size={32} className="mb-3" />
+                <span className="text-xs font-black">{tempProofs.signature ? '更新簽名' : '客戶簽名'}</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="fixed bottom-0 left-0 right-0 p-6 bg-white/90 backdrop-blur-xl border-t border-stone-100 z-50 max-w-md mx-auto pb-safe-offset-4">
+        {isAdmin ? (
+          <>
+            {pkg.status === 'pending' && <Button loading={processing} onClick={() => onStatusUpdate(pkg.id, 'arrived')} className="w-full h-16 text-lg" variant="orange" icon={MapPin}>確認已送達站點</Button>}
+            {pkg.status === 'arrived' && <Button loading={processing} disabled={!(tempProofs.photo || tempProofs.signature)} onClick={() => onStatusUpdate(pkg.id, 'signed', tempProofs)} variant={(tempProofs.photo || tempProofs.signature) ? "success" : "primary"} className="w-full h-16 text-lg" icon={CheckCircle}>完成簽收結案</Button>}
+            {pkg.status === 'signed' && <div className="text-center py-4 text-stone-400 text-[11px] font-black tracking-[0.3em] uppercase bg-stone-50 rounded-2xl border border-stone-100">簽收完成</div>}
+          </>
+        ) : (
+          <div className="flex items-center justify-center py-4 text-stone-400 text-[10px] font-black tracking-[0.2em] bg-stone-50 rounded-2xl border border-stone-100 uppercase">
+            <UserCheck size={14} className="mr-2" /> 訪客模式
+          </div>
+        )}
+      </div>
+
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 bg-stone-900/80 z-[110] flex items-center justify-center p-10 backdrop-blur-sm">
+          <div className="bg-white p-8 rounded-[40px] w-full max-w-xs shadow-2xl">
+            <h4 className="text-xl font-black text-stone-900 mb-2">刪除這筆記錄？</h4>
+            <div className="flex flex-col gap-3 mt-8">
+              <Button variant="danger" onClick={() => { onDelete(pkg.id); setShowDeleteConfirm(false); }} className="w-full h-14">是的，確定移除</Button>
+              <Button variant="secondary" onClick={() => setShowDeleteConfirm(false)} className="w-full h-14 border-none">返回</Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- 主應用入口 ---
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('login'); 
+  const [userRole, setUserRole] = useState(null);
+  const [loginForm, setLoginForm] = useState({ account: '', password: '' });
+  const [loginError, setLoginError] = useState('');
+  const [packages, setPackages] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [tempProofs, setTempProofs] = useState({ photo: null, signature: null });
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [newRecipientName, setNewRecipientName] = useState('');
+  const [photoActionType, setPhotoActionType] = useState('signing');
+  const [processing, setProcessing] = useState(false);
+  
+  const fileInputRef = useRef(null);
+  const activePkg = packages.find(p => p.id === selectedId);
+  const QUICK_RECIPIENTS = ["A11", "A9", "橘一", "橘二", "台中"];
+
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'parcels');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setPackages(data.sort((a, b) => b.createdAt - a.createdAt));
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  const handleLogin = (e) => {
+    if (e) e.preventDefault();
+    const acc = loginForm.account.trim().toLowerCase();
+    const pw = loginForm.password.trim();
+    if ((acc === 'admin' || acc === 'guess') && pw === '1234') {
+      setUserRole(acc);
+      setView('list');
+      setLoginError('');
+    } else {
+      setLoginError('帳號或密碼不正確');
+    }
+  };
+
+  const handleCapture = async (photoUrl) => {
+    setProcessing(true);
+    const compressed = await compressImage(photoUrl, 800, 0.7);
+    if (photoActionType === 'logOnly') {
+      await addPhotoToLog(selectedId, compressed);
+    } else {
+      setTempProofs(prev => ({ ...prev, photo: compressed }));
+    }
+    setProcessing(false);
+  };
+
+  const handleStatusUpdate = async (id, newStatus, proofs = null) => {
+    if (userRole !== 'admin' || !user || processing) return;
+    setProcessing(true);
+    try {
+      const pkgRef = doc(db, 'artifacts', appId, 'public', 'data', 'parcels', id);
+      const now = new Date();
+      const statusText = newStatus === 'arrived' ? '包裹已送達轉運點' : '包裹簽收作業完成';
+      
+      const newEntry = { 
+        status: statusText, 
+        time: now.toLocaleString(), 
+        proofs: proofs ? { ...proofs } : null 
+      };
+
+      const latestPkg = packages.find(p => p.id === id);
+      const updatedTimeline = [...(latestPkg?.timeline || []), newEntry];
+
+      await updateDoc(pkgRef, {
+        status: newStatus,
+        completedAt: newStatus === 'signed' ? now.toISOString() : null,
+        timeline: updatedTimeline
+      });
+
+      if (newStatus === 'signed') setTempProofs({ photo: null, signature: null });
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const addPhotoToLog = async (id, photoUrl) => {
+    if (userRole !== 'admin' || !user) return;
+    const pkgRef = doc(db, 'artifacts', appId, 'public', 'data', 'parcels', id);
+    const latestPkg = packages.find(p => p.id === id);
+    await updateDoc(pkgRef, {
+      timeline: [...(latestPkg?.timeline || []), { 
+        status: '追加包裹現場照片', 
+        time: new Date().toLocaleString(), 
+        proofs: { photo: photoUrl } 
+      }]
+    });
+  };
+
+  const handleDelete = async (id) => {
+    if (userRole !== 'admin' || !user) return;
+    await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'parcels', id));
+    setView('list');
+  };
+
+  const executeAdd = async () => {
+    if (userRole !== 'admin' || !newRecipientName.trim() || !user || processing) return;
+    setProcessing(true);
+    try {
+      const now = new Date();
+      const dateStr = now.toISOString().split('T')[0].replace(/-/g, '');
+      const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+      const tracking = `${dateStr}-${randomSuffix}`;
+      
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'parcels'), {
+        tracking,
+        recipient: newRecipientName.trim(),
+        status: 'pending',
+        createdAt: Date.now(),
+        timeline: [{ status: '包裹已出庫 (運送中)', time: now.toLocaleString() }]
+      });
+      setNewRecipientName('');
+      setShowAddModal(false);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <div className="w-full h-screen bg-[#1c1917] flex justify-center overflow-hidden font-sans">
+      <style>{`
+        .pb-safe-offset-4 { padding-bottom: calc(env(safe-area-inset-bottom) + 1.5rem); }
+        .mt-safe { margin-top: env(safe-area-inset-top); }
+        ::-webkit-scrollbar { display: none; }
+        * { -webkit-tap-highlight-color: transparent; outline: none !important; }
+      `}</style>
+
+      <div className="w-full max-w-md h-full bg-[#fcfcf9] relative overflow-hidden flex flex-col shadow-2xl">
+        
+        {view === 'login' && (
+          <div className="h-full flex flex-col px-10 pt-24 pb-12 animate-in fade-in duration-700 bg-white">
+            <div className="mb-16">
+              <div className="w-full h-1 bg-orange-500 mb-6"></div>
+              <h1 className="text-5xl font-black tracking-tighter text-stone-900 italic leading-none">Orange<br/>Parcel</h1>
+              <p className="text-[10px] text-stone-400 font-black tracking-[0.4em] uppercase mt-4">雲端物流追蹤系統</p>
+            </div>
+            <form onSubmit={handleLogin} className="space-y-4 flex-1">
+              <input type="text" placeholder="系統帳號" className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-6 py-5 font-bold" value={loginForm.account} onChange={(e) => setLoginForm({...loginForm, account: e.target.value})} />
+              <input type="password" placeholder="存取密碼" className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-6 py-5 font-bold" value={loginForm.password} onChange={(e) => setLoginForm({...loginForm, password: e.target.value})} />
+              {loginError && <p className="text-red-500 text-[11px] font-black">{loginError}</p>}
+              <Button variant="orange" className="w-full h-16 mt-4 text-lg" onClick={handleLogin}>啟動系統</Button>
+            </form>
+          </div>
+        )}
+
+        <div className="flex-1 overflow-hidden relative">
+          {view === 'list' && (
+            <div className="h-full flex flex-col animate-in fade-in duration-300">
+              <div className="bg-white/80 backdrop-blur-xl px-6 py-6 border-b flex justify-between items-end sticky top-0 z-50 mt-safe">
+                <div>
+                  <h1 className="text-2xl font-black tracking-tighter text-stone-900 italic">Orange Hub</h1>
+                  <span className={`text-[8px] px-2 py-0.5 rounded-full font-black uppercase tracking-widest mt-1 inline-block ${userRole === 'admin' ? 'bg-orange-500 text-white' : 'bg-stone-200 text-stone-600'}`}>{userRole}</span>
+                </div>
+                <button onClick={() => setView('login')} className="p-3 bg-stone-50 rounded-full text-stone-300"><Lock size={18} /></button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-6 space-y-4 pb-32">
+                {packages.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center opacity-20 py-20">
+                    <ShieldAlert size={64} />
+                    <p className="font-black mt-4 uppercase tracking-[0.2em] text-xs">目前無包裹資料</p>
+                  </div>
+                ) : (
+                  packages.map(pkg => (
+                    <div key={pkg.id} onClick={() => { setSelectedId(pkg.id); setView('detail'); }} className="bg-white p-7 rounded-[32px] border border-stone-100 shadow-sm active:scale-[0.97] transition-all cursor-pointer">
+                      <div className="flex justify-between items-start mb-3">
+                        <span className={`text-[9px] font-black px-3 py-1 rounded-lg uppercase tracking-wider border ${STATUS_CONFIG[pkg.status].color}`}>{STATUS_CONFIG[pkg.status].label}</span>
+                        <ChevronLeft size={16} className="text-stone-200 rotate-180" />
+                      </div>
+                      <h3 className="text-2xl font-black text-stone-900 tracking-tight">{pkg.recipient}</h3>
+                      <p className="text-[10px] text-stone-400 font-mono font-bold mt-1 tracking-widest">{pkg.tracking}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {userRole === 'admin' && (
+                <button onClick={() => setShowAddModal(true)} className="fixed bottom-10 right-8 w-16 h-16 bg-stone-900 rounded-full text-white shadow-2xl flex items-center justify-center z-[60] active:scale-90 transition-transform">
+                  <Plus size={32} />
+                </button>
+              )}
+            </div>
+          )}
+          
+          {view === 'detail' && activePkg && (
+            <PackageDetail 
+              pkg={activePkg} userRole={userRole} processing={processing}
+              onBack={() => { setView('list'); setTempProofs({ photo: null, signature: null }); }} 
+              onStatusUpdate={handleStatusUpdate} 
+              onDelete={handleDelete}
+              onStartAction={(method) => {
+                setPhotoActionType('signing');
+                if (method === 'camera') fileInputRef.current?.click();
+                else setView('signature');
+              }}
+              onAddPhotoOnly={() => {
+                setPhotoActionType('logOnly');
+                fileInputRef.current?.click();
+              }}
+              tempProofs={tempProofs}
+            />
+          )}
+
+          {showAddModal && (
+            <div className="fixed inset-0 bg-stone-900/60 z-[100] flex items-end justify-center backdrop-blur-sm">
+              <div className="bg-white w-full rounded-t-[48px] p-10 pb-16 shadow-2xl max-w-md mx-auto animate-in slide-in-from-bottom duration-500">
+                <div className="flex justify-between items-center mb-8">
+                  <h3 className="text-2xl font-black text-stone-900 tracking-tight">建立新包裹</h3>
+                  <button onClick={() => setShowAddModal(false)} className="p-3 bg-stone-50 rounded-full"><X size={24}/></button>
+                </div>
+                <div className="space-y-6">
+                  <input type="text" value={newRecipientName} onChange={(e) => setNewRecipientName(e.target.value)} placeholder="收件站點人員名稱..." className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-6 py-5 font-bold text-lg" />
+                  <div className="flex flex-wrap gap-2">
+                    {QUICK_RECIPIENTS.map(name => (
+                      <button key={name} onClick={() => setNewRecipientName(name)} className={`px-5 py-2.5 rounded-xl text-xs font-black border transition-all ${newRecipientName === name ? 'bg-orange-500 text-white border-orange-500 shadow-md' : 'bg-white text-stone-500 border-stone-100'}`}>{name}</button>
+                    ))}
+                  </div>
+                  <Button variant="orange" className="w-full h-16 text-lg mt-4" onClick={executeAdd} loading={processing} disabled={!newRecipientName.trim()}>確認入庫</Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => {
+              if (e.target.files?.[0]) {
+                const reader = new FileReader();
+                reader.onload = (ev) => handleCapture(ev.target.result);
+                reader.readAsDataURL(e.target.files[0]);
+              }
+              e.target.value = '';
+            }} />
+
+          {view === 'signature' && <SignaturePad onSave={(url) => { setTempProofs(p => ({...p, signature: url})); setView('detail'); }} onCancel={() => setView('detail')} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
